@@ -1,7 +1,9 @@
 // Small fetch wrapper that attaches the JWT token automatically.
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 export async function api(path, { method = 'GET', body } = {}) {
   const token = localStorage.getItem('token');
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}/api${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
