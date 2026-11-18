@@ -84,12 +84,6 @@ export default function Login() {
             'Sign in'
           )}
         </button>
-
-        <div className="hint stagger" style={{ '--i': 6 }}>
-          <strong>Demo logins</strong>
-          <div>Admin: admin@school.com / admin123</div>
-          <div>Student: student@school.com / student123</div>
-        </div>
       </form>
     </div>
   );
