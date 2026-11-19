@@ -1,5 +1,7 @@
 // Small fetch wrapper that attaches the JWT token automatically.
-const API_BASE = import.meta.env.VITE_API_URL || '';
+// In production set VITE_API_URL to your backend URL (e.g. https://my-api.onrender.com).
+// Locally it is empty, so requests go through the Vite proxy to localhost:5000.
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export async function api(path, { method = 'GET', body } = {}) {
   const token = localStorage.getItem('token');

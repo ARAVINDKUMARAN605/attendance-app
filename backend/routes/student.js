@@ -1,56 +1,65 @@
 const express = require('express');
-const { load, save, todayStr } = require('../db');
+const { all, run, toUser, toAttendance, todayStr } = require('../db');
 const { authRequired, requireRole } = require('../middleware/auth');
+const { wrap } = require('../middleware/wrap');
 
 const router = express.Router();
 router.use(authRequired, requireRole('student'));
 
 // Own profile
-router.get('/me', (req, res) => {
-  const user = load().users.find((u) => u.id === req.auth.id);
-  if (!user) return res.status(404).json({ message: 'Student not found' });
-  const { passwordHash, ...safe } = user;
-  res.json(safe);
-});
+router.get(
+  '/me',
+  wrap(async (req, res) => {
+    const rows = await all('SELECT * FROM users WHERE id = ?', [req.auth.id]);
+    if (!rows[0]) return res.status(404).json({ message: 'Student not found' });
+    res.json(toUser(rows[0]));
+  })
+);
 
 // Own attendance history (newest first)
-router.get('/attendance', (req, res) => {
-  const records = load()
-    .attendance.filter((a) => a.studentId === req.auth.id)
-    .sort((x, y) => (x.date < y.date ? 1 : -1));
-  res.json(records);
-});
+router.get(
+  '/attendance',
+  wrap(async (req, res) => {
+    const rows = await all('SELECT * FROM attendance WHERE student_id = ? ORDER BY date DESC', [req.auth.id]);
+    res.json(rows.map(toAttendance));
+  })
+);
 
 // Mark arrival
-router.post('/check-in', (req, res) => {
-  const db = load();
-  const today = todayStr();
-  const existing = db.attendance.find((a) => a.studentId === req.auth.id && a.date === today);
-  if (existing) return res.status(400).json({ message: 'You have already checked in today' });
-
-  const record = {
-    id: db.nextId++,
-    studentId: req.auth.id,
-    date: today,
-    arrival: new Date().toISOString(),
-    departure: null,
-  };
-  db.attendance.push(record);
-  save(db);
-  res.status(201).json(record);
-});
+router.post(
+  '/check-in',
+  wrap(async (req, res) => {
+    let result;
+    try {
+      result = await run('INSERT INTO attendance (student_id, date, arrival) VALUES (?, ?, UTC_TIMESTAMP(3))', [
+        req.auth.id,
+        todayStr(),
+      ]);
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(400).json({ message: 'You have already checked in today' });
+      }
+      throw err;
+    }
+    const rows = await all('SELECT * FROM attendance WHERE id = ?', [result.insertId]);
+    res.status(201).json(toAttendance(rows[0]));
+  })
+);
 
 // Mark departure
-router.post('/check-out', (req, res) => {
-  const db = load();
-  const today = todayStr();
-  const record = db.attendance.find((a) => a.studentId === req.auth.id && a.date === today);
-  if (!record) return res.status(400).json({ message: 'You have not checked in today' });
-  if (record.departure) return res.status(400).json({ message: 'You have already checked out today' });
-
-  record.departure = new Date().toISOString();
-  save(db);
-  res.json(record);
-});
+router.post(
+  '/check-out',
+  wrap(async (req, res) => {
+    const today = todayStr();
+    const result = await run(
+      'UPDATE attendance SET departure = UTC_TIMESTAMP(3) WHERE student_id = ? AND date = ? AND departure IS NULL',
+      [req.auth.id, today]
+    );
+    const rows = await all('SELECT * FROM attendance WHERE student_id = ? AND date = ?', [req.auth.id, today]);
+    if (!rows[0]) return res.status(400).json({ message: 'You have not checked in today' });
+    if (!result.affectedRows) return res.status(400).json({ message: 'You have already checked out today' });
+    res.json(toAttendance(rows[0]));
+  })
+);
 
 module.exports = router;

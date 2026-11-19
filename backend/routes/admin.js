@@ -1,121 +1,142 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { load, save } = require('../db');
+const { all, run, toUser, toAttendance } = require('../db');
 const { authRequired, requireRole } = require('../middleware/auth');
+const { wrap } = require('../middleware/wrap');
 
 const router = express.Router();
 router.use(authRequired, requireRole('admin'));
 
+// Returns an error message if the email / roll number is already used by another user
+async function findConflict(email, rollNo, exceptId = 0) {
+  const e = await all('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id <> ?', [email, exceptId]);
+  if (e.length) return 'Email already exists';
+  const r = await all(`SELECT id FROM users WHERE role = 'student' AND roll_no = ? AND id <> ?`, [rollNo, exceptId]);
+  if (r.length) return 'Roll number already exists';
+  return null;
+}
+
 // List all students
-router.get('/students', (req, res) => {
-  const students = load()
-    .users.filter((u) => u.role === 'student')
-    .map(({ passwordHash, ...s }) => s);
-  res.json(students);
-});
+router.get(
+  '/students',
+  wrap(async (req, res) => {
+    const rows = await all(`SELECT * FROM users WHERE role = 'student' ORDER BY roll_no`);
+    res.json(rows.map(toUser));
+  })
+);
 
 // Add a student
-router.post('/students', (req, res) => {
-  const { name, email, password, rollNo, department, phone } = req.body || {};
-  if (!name || !email || !password || !rollNo) {
-    return res.status(400).json({ message: 'Name, email, password and roll number are required' });
-  }
-  const db = load();
-  if (db.users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
-    return res.status(409).json({ message: 'Email already exists' });
-  }
-  if (db.users.some((u) => u.role === 'student' && u.rollNo === rollNo)) {
-    return res.status(409).json({ message: 'Roll number already exists' });
-  }
-  const student = {
-    id: db.nextId++,
-    role: 'student',
-    name,
-    email,
-    passwordHash: bcrypt.hashSync(password, 10),
-    rollNo,
-    department: department || '',
-    phone: phone || '',
-  };
-  db.users.push(student);
-  save(db);
-  const { passwordHash, ...safe } = student;
-  res.status(201).json(safe);
-});
+router.post(
+  '/students',
+  wrap(async (req, res) => {
+    const { name, email, password, rollNo, department, phone } = req.body || {};
+    if (!name || !email || !password || !rollNo) {
+      return res.status(400).json({ message: 'Name, email, password and roll number are required' });
+    }
+    const conflict = await findConflict(String(email).trim(), String(rollNo).trim());
+    if (conflict) return res.status(409).json({ message: conflict });
+
+    const result = await run(
+      `INSERT INTO users (role, name, email, password_hash, roll_no, department, phone)
+       VALUES ('student', ?, ?, ?, ?, ?, ?)`,
+      [
+        String(name).trim(),
+        String(email).trim(),
+        bcrypt.hashSync(String(password), 10),
+        String(rollNo).trim(),
+        department || '',
+        phone || '',
+      ]
+    );
+    const rows = await all('SELECT * FROM users WHERE id = ?', [result.insertId]);
+    res.status(201).json(toUser(rows[0]));
+  })
+);
 
 // Edit a student's details and/or reset their password.
 // "password" is optional: leave it out (or empty) to keep the current one.
-router.put('/students/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const { name, email, password, rollNo, department, phone } = req.body || {};
-  const db = load();
-  const student = db.users.find((u) => u.id === id && u.role === 'student');
-  if (!student) return res.status(404).json({ message: 'Student not found' });
+router.put(
+  '/students/:id',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const { name, email, password, rollNo, department, phone } = req.body || {};
+    const cur = (await all(`SELECT * FROM users WHERE id = ? AND role = 'student'`, [id]))[0];
+    if (!cur) return res.status(404).json({ message: 'Student not found' });
 
-  const newName = name !== undefined ? String(name).trim() : student.name;
-  const newEmail = email !== undefined ? String(email).trim() : student.email;
-  const newRoll = rollNo !== undefined ? String(rollNo).trim() : student.rollNo;
-  if (!newName || !newEmail || !newRoll) {
-    return res.status(400).json({ message: 'Name, email and roll number are required' });
-  }
-  if (db.users.some((u) => u.id !== id && u.email.toLowerCase() === newEmail.toLowerCase())) {
-    return res.status(409).json({ message: 'Email already exists' });
-  }
-  if (db.users.some((u) => u.id !== id && u.role === 'student' && u.rollNo === newRoll)) {
-    return res.status(409).json({ message: 'Roll number already exists' });
-  }
-  if (password && String(password).length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters' });
-  }
+    const newName = name !== undefined ? String(name).trim() : cur.name;
+    const newEmail = email !== undefined ? String(email).trim() : cur.email;
+    const newRoll = rollNo !== undefined ? String(rollNo).trim() : cur.roll_no;
+    if (!newName || !newEmail || !newRoll) {
+      return res.status(400).json({ message: 'Name, email and roll number are required' });
+    }
+    if (password && String(password).length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    }
+    const conflict = await findConflict(newEmail, newRoll, id);
+    if (conflict) return res.status(409).json({ message: conflict });
 
-  student.name = newName;
-  student.email = newEmail;
-  student.rollNo = newRoll;
-  if (department !== undefined) student.department = department;
-  if (phone !== undefined) student.phone = phone;
-  if (password) student.passwordHash = bcrypt.hashSync(String(password), 10);
-
-  save(db);
-  const { passwordHash, ...safe } = student;
-  res.json(safe);
-});
+    const hash = password ? bcrypt.hashSync(String(password), 10) : cur.password_hash;
+    await run(
+      `UPDATE users SET name = ?, email = ?, roll_no = ?, department = ?, phone = ?, password_hash = ? WHERE id = ?`,
+      [
+        newName,
+        newEmail,
+        newRoll,
+        department !== undefined ? department : cur.department,
+        phone !== undefined ? phone : cur.phone,
+        hash,
+        id,
+      ]
+    );
+    const rows = await all('SELECT * FROM users WHERE id = ?', [id]);
+    res.json(toUser(rows[0]));
+  })
+);
 
 // Delete a student (and their attendance)
-router.delete('/students/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const db = load();
-  const idx = db.users.findIndex((u) => u.id === id && u.role === 'student');
-  if (idx === -1) return res.status(404).json({ message: 'Student not found' });
-  db.users.splice(idx, 1);
-  db.attendance = db.attendance.filter((a) => a.studentId !== id);
-  save(db);
-  res.json({ message: 'Student deleted' });
-});
+router.delete(
+  '/students/:id',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const result = await run(`DELETE FROM users WHERE id = ? AND role = 'student'`, [id]);
+    if (!result.affectedRows) return res.status(404).json({ message: 'Student not found' });
+    await run('DELETE FROM attendance WHERE student_id = ?', [id]);
+    res.json({ message: 'Student deleted' });
+  })
+);
 
 // Attendance records with arrival / departure times
 // Optional filters: ?date=YYYY-MM-DD  ?studentId=2
-router.get('/attendance', (req, res) => {
-  const { date, studentId } = req.query;
-  const db = load();
-  const students = new Map(db.users.filter((u) => u.role === 'student').map((s) => [s.id, s]));
-
-  let records = db.attendance;
-  if (date) records = records.filter((a) => a.date === date);
-  if (studentId) records = records.filter((a) => a.studentId === Number(studentId));
-
-  const result = records
-    .map((a) => {
-      const s = students.get(a.studentId);
-      return {
-        ...a,
-        studentName: s ? s.name : 'Unknown',
-        rollNo: s ? s.rollNo : '-',
-        department: s ? s.department : '-',
-      };
-    })
-    .sort((x, y) => (x.date < y.date ? 1 : x.date > y.date ? -1 : x.arrival < y.arrival ? 1 : -1));
-
-  res.json(result);
-});
+router.get(
+  '/attendance',
+  wrap(async (req, res) => {
+    const { date, studentId } = req.query;
+    const where = [];
+    const params = [];
+    if (date) {
+      where.push('a.date = ?');
+      params.push(date);
+    }
+    if (studentId) {
+      where.push('a.student_id = ?');
+      params.push(Number(studentId));
+    }
+    const rows = await all(
+      `SELECT a.*, u.name AS student_name, u.roll_no, u.department
+       FROM attendance a JOIN users u ON u.id = a.student_id
+       ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY a.date DESC, a.arrival DESC`,
+      params
+    );
+    res.json(
+      rows.map((r) => ({
+        ...toAttendance(r),
+        studentName: r.student_name,
+        rollNo: r.roll_no,
+        department: r.department,
+      }))
+    );
+  })
+);
 
 module.exports = router;
